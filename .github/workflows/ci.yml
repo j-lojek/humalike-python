@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m compileall -q src examples
+      - run: pytest --cov=humalike --cov-report=term-missing --cov-fail-under=88
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src examples
+
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.10"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "httpx==0.27.0" "typing-extensions==4.8.0" "websockets==12.0" "pytest>=8,<9"
+      - run: python -m pip install --no-deps -e .
+      - run: pytest -q
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pip-audit
+      - run: python -m venv /tmp/humalike-audit-target
+      - run: /tmp/humalike-audit-target/bin/python -m pip install --upgrade pip
+      - run: /tmp/humalike-audit-target/bin/python -m pip install ".[websocket]"
+      - name: Audit resolved runtime dependencies
+        run: |
+          site_packages="$(/tmp/humalike-audit-target/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+          python -m pip_audit --path "$site_packages"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build check-wheel-contents twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: check-wheel-contents dist/*.whl
+      - run: python -m venv /tmp/humalike-wheel
+      - name: Install the built wheel with its WebSocket extra
+        run: |
+          wheel="$(realpath dist/*.whl)"
+          /tmp/humalike-wheel/bin/python -m pip install "humalike-python[websocket] @ file://$wheel"
+      - run: /tmp/humalike-wheel/bin/python -m pip check
+      - run: /tmp/humalike-wheel/bin/python -c "import asyncio, websockets; from humalike import AsyncHumalikeClient, HumalikeClient, TurnTakingStream; s=HumalikeClient('test-token-release'); a=AsyncHumalikeClient('test-token-release'); assert 'redacted' in repr(s) and 'redacted' in repr(a); assert TurnTakingStream and websockets; s.close(); asyncio.run(a.close())"
+      - run: python -m venv /tmp/humalike-sdist
+      - name: Install the built source distribution
+        run: /tmp/humalike-sdist/bin/python -m pip install dist/*.tar.gz
+      - run: /tmp/humalike-sdist/bin/python -m pip check
+      - run: /tmp/humalike-sdist/bin/python -c "import humalike; assert humalike.__version__ == '0.1.0b1'"
+      - name: Check source distribution examples and generated files
+        run: |
+          entries="$(tar -tzf dist/*.tar.gz)"
+          for example in quickstart.py async_quickstart.py response_metadata.py social_learning.py social_observability.py theory_of_mind.py social_memory.py personas.py turn_taking.py; do
+            grep -q "/examples/$example$" <<< "$entries"
+          done
+          ! grep -Eq '(__pycache__|\.pyc$|\.coverage|\.env($|\.)|\.mypy_cache|\.pytest_cache|\.ruff_cache)' <<< "$entries"
